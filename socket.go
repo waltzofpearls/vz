@@ -7,13 +7,13 @@ package vz
 */
 import "C"
 import (
-	"errors"
 	"fmt"
 	"net"
 	"os"
 	"runtime"
 	"runtime/cgo"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -201,7 +201,7 @@ func (v *VirtioSocketListener) Close() error {
 		v.handle.Delete()
 		v.acceptch <- connResults{
 			conn: nil,
-			err:  errors.New("accept failed: listener has been closed"),
+			err:  fmt.Errorf("accept failed: listener has been closed: %w", net.ErrClosed),
 		}
 		close(v.acceptch)
 	})
@@ -273,7 +273,13 @@ var _ net.Conn = (*VirtioSocketConnection)(nil)
 
 func newVirtioSocketConnection(ptr unsafe.Pointer) (*VirtioSocketConnection, error) {
 	vzVirtioSocketConnection := C.convertVZVirtioSocketConnection2Flat(ptr)
-	file := os.NewFile((uintptr)(vzVirtioSocketConnection.fileDescriptor), "")
+	// The VZVirtioSocketConnection owns its descriptor and closes it when it is freed, so closing it here
+	// too could close whatever reused the number. Work on a copy instead.
+	descriptor, err := duplicateCloseOnExec(int(vzVirtioSocketConnection.fileDescriptor))
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(descriptor), "vsock")
 	defer file.Close()
 	rawConn, err := net.FileConn(file)
 	if err != nil {
@@ -285,6 +291,17 @@ func newVirtioSocketConnection(ptr unsafe.Pointer) (*VirtioSocketConnection, err
 		sourcePort:      (uint32)(vzVirtioSocketConnection.sourcePort),
 	}
 	return conn, nil
+}
+
+func duplicateCloseOnExec(descriptor int) (int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	duplicate, err := syscall.Dup(descriptor)
+	if err != nil {
+		return -1, fmt.Errorf("duplicate the vsock descriptor: %w", err)
+	}
+	syscall.CloseOnExec(duplicate)
+	return duplicate, nil
 }
 
 // Read reads data from connection of the vsock protocol.
